@@ -1,0 +1,27 @@
+name: vacuum-interlock
+
+services:
+  app:
+    build: .
+    image: vacuum-interlock:latest
+    ports:
+      # 宿主端口可配置：HOST_PORT=9090 docker compose up app
+      - "${HOST_PORT:-8080}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  verify:
+    build: .
+    image: vacuum-interlock:latest
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      BASE_URL: "http://app:8000"
+    # 执行构建检查 + 代码测试 + 因果场景 HTTP 冒烟，随后退出并以退出码报告结果
+    command: ["bash", "verify/verify.sh"]

@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>同步辐射真空阀联锁控制台</title>
+<style>
+  :root { --bg:#0f1620; --panel:#182230; --line:#2a3a4d; --txt:#dbe6f2; --dim:#8aa0b8;
+          --ok:#2fbf71; --wait:#e0a63c; --rej:#e05c5c; --acc:#4f8fdd; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+         background:var(--bg); color:var(--txt); }
+  header { padding:16px 24px; border-bottom:1px solid var(--line); }
+  header h1 { margin:0; font-size:20px; }
+  header p { margin:4px 0 0; color:var(--dim); font-size:13px; }
+  main { display:grid; grid-template-columns:1fr 1fr; gap:16px; padding:16px 24px 40px; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  section h2 { margin:0 0 12px; font-size:15px; color:var(--acc); }
+  .wide { grid-column:1 / -1; }
+  label { display:block; font-size:12px; color:var(--dim); margin:8px 0 4px; }
+  input, select, textarea, button { font:inherit; font-size:13px; }
+  input, select, textarea { width:100%; padding:7px 9px; border-radius:6px;
+         border:1px solid var(--line); background:#101a26; color:var(--txt); }
+  textarea { font-family:ui-monospace,Consolas,monospace; }
+  button { padding:7px 14px; border-radius:6px; border:1px solid var(--acc);
+         background:var(--acc); color:#fff; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--acc); }
+  button:hover { filter:brightness(1.12); }
+  .row { display:flex; gap:8px; align-items:end; }
+  .row > * { flex:1; }
+  .row > button { flex:0 0 auto; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--dim); font-weight:normal; font-size:12px; }
+  .badge { display:inline-block; padding:2px 9px; border-radius:10px; font-size:12px; }
+  .b-open { background:rgba(47,191,113,.16); color:var(--ok); }
+  .b-closed { background:rgba(138,160,184,.16); color:var(--dim); }
+  .b-rel { background:rgba(47,191,113,.16); color:var(--ok); }
+  .b-wait { background:rgba(224,166,60,.16); color:var(--wait); }
+  .b-rej { background:rgba(224,92,92,.16); color:var(--rej); }
+  .muted { color:var(--dim); font-size:12px; }
+  #result-banner { margin-top:10px; padding:10px 12px; border-radius:8px; display:none; font-size:13px; }
+  .mono { font-family:ui-monospace,Consolas,monospace; font-size:12px; }
+  ul.waiting { margin:0; padding-left:0; list-style:none; }
+  ul.waiting li { padding:7px 9px; border:1px solid var(--line); border-radius:6px; margin-bottom:6px; }
+  .hint { font-size:12px; color:var(--dim); margin-top:6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>同步辐射真空阀联锁控制台</h1>
+  <p>多控制台离线提交 · 因果有序消费 · 事件标识稳定裁决 · 预条件拒绝亦推进因果位置</p>
+</header>
+<main>
+  <section>
+    <h2>① 建立轮次（值班员）</h2>
+    <label>轮次名称</label>
+    <input id="round-name" value="夜班联锁轮次">
+    <label>控制台（二至五个，每行一个名称）</label>
+    <textarea id="round-consoles" rows="3">控制台A
+控制台B
+控制台C</textarea>
+    <label>阀门（每行：名称[,初始状态 OPEN/CLOSED]）</label>
+    <textarea id="round-valves" rows="3">前端区阀V1,CLOSED
+光束线阀V2,CLOSED</textarea>
+    <div style="margin-top:10px"><button onclick="createRound()">建立轮次</button></div>
+    <div class="hint">轮次建立后，控制台与阀门获得固定标识（c1…/v1…）。</div>
+  </section>
+
+  <section>
+    <h2>② 选择轮次</h2>
+    <div class="row">
+      <div>
+        <label>当前轮次</label>
+        <select id="round-select" onchange="pickRound()"></select>
+      </div>
+      <button class="ghost" onclick="refreshAll()">刷新</button>
+    </div>
+    <label style="margin-top:10px"><input type="checkbox" id="auto-refresh" checked style="width:auto"> 自动刷新（1.5s）</label>
+    <div id="round-meta" class="hint"></div>
+  </section>
+
+  <section class="wide">
+    <h2>③ 状态总览 —— 阀门状态 / 因果前沿 / 等待项</h2>
+    <div class="row" style="align-items:flex-start">
+      <div>
+        <h3 class="muted">阀门状态</h3>
+        <table id="valve-table"><thead><tr><th>标识</th><th>名称</th><th>状态</th></tr></thead><tbody></tbody></table>
+      </div>
+      <div>
+        <h3 class="muted">因果前沿（各控制台已消费序号）</h3>
+        <table id="frontier-table"><thead><tr><th>控制台</th><th>名称</th><th>已消费序号</th></tr></thead><tbody></tbody></table>
+      </div>
+      <div>
+        <h3 class="muted">等待项（依赖未满足 / 前驱未消费）</h3>
+        <ul class="waiting" id="waiting-list"></ul>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>④ 提交联锁事件（真实接口）</h2>
+    <div class="row">
+      <div>
+        <label>事件标识（唯一）</label>
+        <input id="ev-id" class="mono">
+      </div>
+      <button class="ghost" onclick="genId()">生成标识</button>
+    </div>
+    <div class="row">
+      <div>
+        <label>控制台</label>
+        <select id="ev-console" onchange="suggestSeq()"></select>
+      </div>
+      <div>
+        <label>本地序号</label>
+        <input id="ev-seq" type="number" min="1" value="1">
+      </div>
+    </div>
+    <label>完整依赖向量（JSON：控制台标识 → 已见序号）</label>
+    <textarea id="ev-deps" rows="2" class="mono">{}</textarea>
+    <div style="margin-top:6px"><button class="ghost" onclick="fillDeps()">按当前前沿填充依赖</button></div>
+    <div class="row">
+      <div>
+        <label>目标阀门</label>
+        <select id="ev-valve"></select>
+      </div>
+      <div>
+        <label>期望旧状态</label>
+        <select id="ev-old"><option>CLOSED</option><option>OPEN</option></select>
+      </div>
+      <div>
+        <label>新状态</label>
+        <select id="ev-new"><option>OPEN</option><option>CLOSED</option></select>
+      </div>
+    </div>
+    <div style="margin-top:10px"><button onclick="submitEvent()">提交事件</button></div>
+    <div id="result-banner"></div>
+  </section>
+
+  <section>
+    <h2>⑤ 离线批量提交（恢复联网）</h2>
+    <label>事件数组（JSON，同批可放行项按事件标识稳定裁决）</label>
+    <textarea id="batch-json" rows="8" class="mono" placeholder='[{"event_id":"evt-...","console_id":"c1","seq":1,"deps":{},"valve_id":"v1","expected_old_state":"CLOSED","new_state":"OPEN"}]'></textarea>
+    <div style="margin-top:10px"><button onclick="submitBatch()">批量提交</button></div>
+    <div id="batch-result" class="hint"></div>
+  </section>
+
+  <section class="wide">
+    <h2>⑥ 事件日志（消费顺序 · 放行/拒绝原因）</h2>
+    <table id="log-table">
+      <thead><tr><th>事件标识</th><th>控制台#序号</th><th>阀门</th><th>期望旧状态</th><th>新状态</th><th>结论</th><th>原因</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+
+<script>
+let currentRound = null;
+let lastState = null;
+const $ = (id) => document.getElementById(id);
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, Object.assign({headers: {"Content-Type": "application/json"}}, opts));
+  const text = await r.text();
+  let data; try { data = JSON.parse(text); } catch { data = text; }
+  if (!r.ok) {
+    const msg = (data && data.detail) ? JSON.stringify(data.detail) : String(data);
+    throw new Error(r.status + " " + msg);
+  }
+  return data;
+}
+
+function badge(txt, cls) { return `<span class="badge ${cls}">${txt}</span>`; }
+function outcomeBadge(o) {
+  if (o === "RELEASED") return badge("放行", "b-rel");
+  if (o === "WAITING") return badge("等待", "b-wait");
+  return badge("拒绝", "b-rej");
+}
+
+async function createRound() {
+  const name = $("round-name").value.trim();
+  const consoles = $("round-consoles").value.split("\n").map(s => s.trim()).filter(Boolean);
+  const valves = $("round-valves").value.split("\n").map(s => s.trim()).filter(Boolean).map(line => {
+    const [nm, st] = line.split(",").map(x => x.trim());
+    return {name: nm, state: (st || "CLOSED").toUpperCase()};
+  });
+  try {
+    const st = await api("/rounds", {method: "POST", body: JSON.stringify({name, consoles, valves})});
+    currentRound = st.round_id;
+    await refreshRounds();
+    renderState(st);
+    showResult({outcome: "RELEASED", reason: "轮次已建立：" + st.round_id}, false);
+  } catch (e) { showResult({outcome: "REJECTED", reason: "建立轮次失败：" + e.message}, false); }
+}
+
+async function refreshRounds() {
+  const data = await api("/rounds");
+  const sel = $("round-select");
+  sel.innerHTML = "";
+  for (const r of data.rounds) {
+    const op = document.createElement("option");
+    op.value = r.round_id;
+    op.textContent = `${r.name}（${r.round_id}，${r.consoles}控制台/${r.valves}阀门）`;
+    if (r.round_id === currentRound) op.selected = true;
+    sel.appendChild(op);
+  }
+  if (!currentRound && data.rounds.length) currentRound = data.rounds[0].round_id;
+}
+
+function pickRound() { currentRound = $("round-select").value; loadState(); }
+
+async function loadState() {
+  if (!currentRound) return;
+  try { renderState(await api("/rounds/" + currentRound)); } catch (e) { console.warn(e); }
+}
+
+function renderState(st) {
+  lastState = st;
+  $("round-meta").textContent = `轮次 ${st.round_id} · ${st.name}`;
+  $("valve-table").querySelector("tbody").innerHTML = st.valves.map(v =>
+    `<tr><td class="mono">${v.id}</td><td>${v.name}</td><td>${v.state === "OPEN" ? badge("OPEN 开启","b-open") : badge("CLOSED 关闭","b-closed")}</td></tr>`).join("");
+  $("frontier-table").querySelector("tbody").innerHTML = st.consoles.map(c =>
+    `<tr><td class="mono">${c.id}</td><td>${c.name}</td><td>${st.frontier[c.id]}</td></tr>`).join("");
+  const wl = $("waiting-list");
+  wl.innerHTML = st.waiting.length ? st.waiting.map(w =>
+    `<li><span class="mono">${w.event_id}</span> ${badge("等待","b-wait")}<br>
+     <span class="muted">${w.console_id}#${w.seq} → ${w.valve_id}｜${w.reason}
+     ${Object.keys(w.unmet).length ? "｜未满足：" + JSON.stringify(w.unmet) : ""}</span></li>`).join("")
+    : `<li class="muted">（无等待项）</li>`;
+  $("log-table").querySelector("tbody").innerHTML = st.log.map(e =>
+    `<tr><td class="mono">${e.event_id}</td><td class="mono">${e.console_id}#${e.seq}</td>
+     <td class="mono">${e.valve_id}</td><td>${e.expected_old_state}</td><td>${e.new_state}</td>
+     <td>${outcomeBadge(e.outcome)}</td><td class="muted">${e.reason}</td></tr>`).join("");
+  const cs = $("ev-console");
+  const prevC = cs.value;
+  cs.innerHTML = st.consoles.map(c => `<option value="${c.id}">${c.name}（${c.id}）</option>`).join("");
+  if (prevC) cs.value = prevC;
+  const vs = $("ev-valve");
+  const prevV = vs.value;
+  vs.innerHTML = st.valves.map(v => `<option value="${v.id}">${v.name}（${v.id}，当前 ${v.state}）</option>`).join("");
+  if (prevV) vs.value = prevV;
+}
+
+function genId() { $("ev-id").value = "evt-" + crypto.randomUUID().slice(0, 8); }
+
+function suggestSeq() {
+  if (!lastState) return;
+  const c = $("ev-console").value;
+  const waiting = lastState.waiting.filter(w => w.console_id === c).length;
+  $("ev-seq").value = lastState.frontier[c] + 1 + waiting;
+}
+
+function fillDeps() {
+  if (!lastState) return;
+  $("ev-deps").value = JSON.stringify(lastState.frontier);
+}
+
+function showResult(res, isErr) {
+  const b = $("result-banner");
+  b.style.display = "block";
+  const color = res.outcome === "RELEASED" ? "var(--ok)" : res.outcome === "WAITING" ? "var(--wait)" : "var(--rej)";
+  b.style.border = "1px solid " + color;
+  b.innerHTML = `${outcomeBadge(res.outcome)} <b>${res.outcome}</b>　${res.reason || ""}` +
+    (res.duplicate ? '　<span class="muted">（重投，返回既有结论）</span>' : "");
+}
+
+async function submitEvent() {
+  if (!currentRound) { alert("请先建立轮次"); return; }
+  let deps;
+  try { deps = JSON.parse($("ev-deps").value || "{}"); }
+  catch { alert("依赖向量不是合法 JSON"); return; }
+  const payload = {
+    event_id: $("ev-id").value.trim(),
+    console_id: $("ev-console").value,
+    seq: parseInt($("ev-seq").value, 10),
+    deps,
+    valve_id: $("ev-valve").value,
+    expected_old_state: $("ev-old").value,
+    new_state: $("ev-new").value,
+  };
+  try {
+    const r = await api(`/rounds/${currentRound}/events`, {method: "POST", body: JSON.stringify(payload)});
+    showResult(r.result);
+    renderState(r.state);
+    genId(); suggestSeq();
+  } catch (e) { showResult({outcome: "REJECTED", reason: e.message}); }
+}
+
+async function submitBatch() {
+  if (!currentRound) { alert("请先建立轮次"); return; }
+  let events;
+  try { events = JSON.parse($("batch-json").value); }
+  catch { alert("批量内容不是合法 JSON"); return; }
+  try {
+    const r = await api(`/rounds/${currentRound}/events/batch`, {method: "POST", body: JSON.stringify({events})});
+    $("batch-result").innerHTML = r.results.map(x =>
+      `<div>${outcomeBadge(x.outcome)} <span class="mono">${x.event_id}</span> ${x.reason}</div>`).join("");
+    renderState(r.state);
+  } catch (e) { $("batch-result").textContent = "批量提交失败：" + e.message; }
+}
+
+async function refreshAll() { await refreshRounds(); await loadState(); }
+
+genId();
+refreshAll();
+setInterval(() => { if ($("auto-refresh").checked) loadState(); }, 1500);
+</script>
+</body>
+</html>
