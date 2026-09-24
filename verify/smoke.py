@@ -8,7 +8,9 @@
 3. 同一事件重投返回既有结论；标识复用而载荷变化、跳号、未知控制台、
    未来依赖均被明确拒绝且不改阀门状态；
 4. 预条件不符拒绝但推进因果位置；
-5. 健康入口与业务接口可观察到正确响应。
+5. 健康入口与业务接口可观察到正确响应；
+6. 夜班离线恢复链（A 连续两项 + B、C 跨控制台依赖）整批一起放行，
+   且与请求中的排列无关。
 
 退出码：0 = 全部通过；1 = 存在失败项。
 """
@@ -195,6 +197,35 @@ def run_scenarios():
     got = {x["event_id"]: x["outcome"] for x in r.json()["results"]}
     check("批量提交同批按事件标识裁决",
           got == {"evt-a-002": "RELEASED", "evt-z-002": "REJECTED_PRECONDITION"}, str(got))
+
+    # ---- 6. 夜班离线恢复链：A 连续两项 + B、C 跨控制台依赖，整批一起放行 ----
+    chain = [
+        ev("evt-z-a1", "c1", 1, {}, valve="v1"),                          # A#1 开 V1
+        ev("evt-a-a2", "c1", 2, {}, valve="v2"),                          # A#2 开 V2
+        ev("evt-b-b1", "c2", 1, {"c1": 2}, valve="v2", old="OPEN", new="CLOSED"),
+        ev("evt-c-c1", "c3", 1, {"c2": 1}, valve="v1", old="OPEN", new="CLOSED"),
+    ]
+    # 同一链路的两种请求排列（正序 / 逆序）结论必须一致
+    for label, ordered in [("正序", chain), ("逆序", chain[::-1])]:
+        rid = make_round(f"冒烟轮次四-{label}")
+        r = requests.post(f"{BASE}/rounds/{rid}/events/batch",
+                          json={"events": ordered}, timeout=5)
+        body = r.json()
+        got = {x["event_id"]: x["outcome"] for x in body["results"]}
+        check(f"离线恢复链四项全部放行（{label}）",
+              got == {"evt-z-a1": "RELEASED", "evt-a-a2": "RELEASED",
+                      "evt-b-b1": "RELEASED", "evt-c-c1": "RELEASED"}, str(got))
+        st = body["state"]
+        check(f"恢复后前沿为 2/1/1 且无等待项（{label}）",
+              st["frontier"] == {"c1": 2, "c2": 1, "c3": 1} and st["waiting"] == [],
+              f"{st['frontier']} waiting={st['waiting']}")
+        check(f"两阀门最终均为关闭（{label}）",
+              valve_states(st) == {"v1": "CLOSED", "v2": "CLOSED"},
+              str(valve_states(st)))
+        check(f"事件日志按因果顺序（{label}）",
+              [e["event_id"] for e in st["log"]] ==
+              ["evt-z-a1", "evt-a-a2", "evt-b-b1", "evt-c-c1"],
+              str([e["event_id"] for e in st["log"]]))
 
 
 if __name__ == "__main__":

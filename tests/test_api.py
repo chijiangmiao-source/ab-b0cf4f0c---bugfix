@@ -1,4 +1,6 @@
 """HTTP API 层测试（FastAPI TestClient）。"""
+import itertools
+
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -114,3 +116,88 @@ def test_batch_endpoint():
     assert r.status_code == 200
     got = {x["event_id"]: x["outcome"] for x in r.json()["results"]}
     assert got == {"evt-a-2": "RELEASED", "evt-z-2": "REJECTED_PRECONDITION"}
+
+
+# ----------------------------------------------------------------------
+# 夜班离线恢复链：三控制台四事件，经批量接口恢复
+# ----------------------------------------------------------------------
+def night_shift_events():
+    return [
+        {"event_id": "evt-z-a1", "console_id": "c1", "seq": 1, "deps": {},
+         "valve_id": "v1", "expected_old_state": "CLOSED", "new_state": "OPEN"},
+        {"event_id": "evt-a-a2", "console_id": "c1", "seq": 2, "deps": {},
+         "valve_id": "v2", "expected_old_state": "CLOSED", "new_state": "OPEN"},
+        {"event_id": "evt-b-b1", "console_id": "c2", "seq": 1, "deps": {"c1": 2},
+         "valve_id": "v2", "expected_old_state": "OPEN", "new_state": "CLOSED"},
+        {"event_id": "evt-c-c1", "console_id": "c3", "seq": 1, "deps": {"c2": 1},
+         "valve_id": "v1", "expected_old_state": "OPEN", "new_state": "CLOSED"},
+    ]
+
+
+def assert_night_shift_ok(body):
+    got = {x["event_id"]: x["outcome"] for x in body["results"]}
+    assert got == {"evt-z-a1": "RELEASED", "evt-a-a2": "RELEASED",
+                   "evt-b-b1": "RELEASED", "evt-c-c1": "RELEASED"}
+    st = body["state"]
+    assert st["frontier"] == {"c1": 2, "c2": 1, "c3": 1}
+    assert st["waiting"] == []
+    valves = {v["id"]: v["state"] for v in st["valves"]}
+    assert valves == {"v1": "CLOSED", "v2": "CLOSED"}
+    assert [e["event_id"] for e in st["log"]] == [
+        "evt-z-a1", "evt-a-a2", "evt-b-b1", "evt-c-c1"]
+
+
+def test_offline_recovery_chain_over_http():
+    """离线恢复批量提交：四项操作一起接收、连续裁决、全部放行。"""
+    rid = make_round()
+    r = client.post(f"/rounds/{rid}/events/batch",
+                    json={"events": night_shift_events()})
+    assert r.status_code == 200
+    assert_night_shift_ok(r.json())
+    # 单事件结论可稳定复查
+    e = client.get(f"/rounds/{rid}/events/evt-c-c1").json()
+    assert e["outcome"] == "RELEASED"
+
+
+def test_offline_recovery_chain_request_order_invariant_over_http():
+    """请求排列不影响结论：抽样若干排列，状态与日志完全一致。"""
+    events = night_shift_events()
+    perms = list(itertools.permutations(range(len(events))))
+    sampled = [perms[0], perms[5], perms[11], perms[17], perms[23]]
+    signatures = set()
+    for perm in sampled:
+        rid = make_round()
+        r = client.post(f"/rounds/{rid}/events/batch",
+                        json={"events": [events[i] for i in perm]})
+        assert r.status_code == 200
+        body = r.json()
+        assert_night_shift_ok(body)
+        st = client.get(f"/rounds/{rid}").json()
+        signatures.add((
+            tuple(e["event_id"] for e in st["log"]),
+            tuple(sorted(st["frontier"].items())),
+            tuple(sorted((v["id"], v["state"]) for v in st["valves"])),
+        ))
+    assert len(signatures) == 1
+
+
+def test_offline_recovery_chain_split_over_http():
+    """分批补交同一恢复链：等待 → 真未来依赖拒绝 → 补齐后级联放行。"""
+    rid = make_round()
+    a1, a2, b1, c1 = night_shift_events()
+    r = client.post(f"/rounds/{rid}/events/batch", json={"events": [c1]})
+    assert r.json()["results"][0]["outcome"] == "WAITING"
+    st = client.get(f"/rounds/{rid}").json()
+    assert [w["event_id"] for w in st["waiting"]] == ["evt-c-c1"]
+    r = client.post(f"/rounds/{rid}/events/batch", json={"events": [b1]})
+    assert r.json()["results"][0]["outcome"] == "REJECTED_FUTURE_DEPENDENCY"
+    r = client.post(f"/rounds/{rid}/events/batch", json={"events": [a1, a2]})
+    assert [x["outcome"] for x in r.json()["results"]] == ["RELEASED", "RELEASED"]
+    r = client.post(f"/rounds/{rid}/events/batch", json={"events": [b1]})
+    body = r.json()
+    assert body["results"][0]["outcome"] == "RELEASED"
+    assert [e["event_id"] for e in body["resolved"]] == ["evt-b-b1", "evt-c-c1"]
+    st = client.get(f"/rounds/{rid}").json()
+    assert st["frontier"] == {"c1": 2, "c2": 1, "c3": 1}
+    valves = {v["id"]: v["state"] for v in st["valves"]}
+    assert valves == {"v1": "CLOSED", "v2": "CLOSED"}
