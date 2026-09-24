@@ -8,7 +8,9 @@
 3. 同一事件重投返回既有结论；标识复用而载荷变化、跳号、未知控制台、
    未来依赖均被明确拒绝且不改阀门状态；
 4. 预条件不符拒绝但推进因果位置；
-5. 健康入口与业务接口可观察到正确响应。
+5. 健康入口与业务接口可观察到正确响应；
+6. 离线恢复链（同控制台连续操作 + 跨控制台依赖）同批到达即连续裁决，
+   请求排列不影响结论、事件日志与最终阀门状态。
 
 退出码：0 = 全部通过；1 = 存在失败项。
 """
@@ -195,6 +197,46 @@ def run_scenarios():
     got = {x["event_id"]: x["outcome"] for x in r.json()["results"]}
     check("批量提交同批按事件标识裁决",
           got == {"evt-a-002": "RELEASED", "evt-z-002": "REJECTED_PRECONDITION"}, str(got))
+
+    # ---- 6. 离线恢复链：同控制台连续操作 + 跨控制台依赖同批到达 ----
+    # A#1 开 V1 → A#2 开 V2 → B#1（依赖 A#2）关 V2 → C#1（依赖 B#1）关 V1
+    chain = [
+        ev("evt-z-a1", "c1", 1, {}, valve="v1"),
+        ev("evt-a-a2", "c1", 2, {}, valve="v2"),
+        ev("evt-b-b1", "c2", 1, {"c1": 2}, valve="v2", old="OPEN", new="CLOSED"),
+        ev("evt-c-c1", "c3", 1, {"c2": 1}, valve="v1", old="OPEN", new="CLOSED"),
+    ]
+    chain_log = [e["event_id"] for e in chain]
+
+    def check_chain(rid, order, label):
+        r = requests.post(f"{BASE}/rounds/{rid}/events/batch",
+                          json={"events": [chain[i] for i in order]}, timeout=5)
+        body = r.json()
+        check(f"{label}：响应与请求条目逐一对应",
+              [x["event_id"] for x in body["results"]]
+              == [chain[i]["event_id"] for i in order], str(body["results"]))
+        got = {x["event_id"]: x["outcome"] for x in body["results"]}
+        check(f"{label}：四项操作同批全部放行",
+              got == {eid: "RELEASED" for eid in chain_log}, str(got))
+        check(f"{label}：同批事件按因果顺序连续消费",
+              [e["event_id"] for e in body["resolved"]] == chain_log,
+              str([e["event_id"] for e in body["resolved"]]))
+        st = state(rid)
+        check(f"{label}：前沿推进为 A=2,B=1,C=1 且无等待项",
+              st["frontier"] == {"c1": 2, "c2": 1, "c3": 1} and st["waiting"] == [],
+              f"{st['frontier']} waiting={st['waiting']}")
+        check(f"{label}：事件日志按因果顺序记录",
+              [e["event_id"] for e in st["log"]] == chain_log,
+              str([e["event_id"] for e in st["log"]]))
+        check(f"{label}：两阀门最终均为关闭",
+              valve_states(st) == {"v1": "CLOSED", "v2": "CLOSED"},
+              str(valve_states(st)))
+
+    # 按 A 的本地记录顺序再接 B、C 提交
+    check_chain(make_round("冒烟轮次四"), [0, 1, 2, 3], "离线恢复链（记录顺序）")
+    # 不同请求排列（依赖先于前驱到达、同控制台连续操作被拆开）结论一致
+    check_chain(make_round("冒烟轮次五"), [3, 2, 1, 0], "离线恢复链（完全逆序）")
+    check_chain(make_round("冒烟轮次六"), [2, 0, 3, 1], "离线恢复链（交叉排列）")
 
 
 if __name__ == "__main__":

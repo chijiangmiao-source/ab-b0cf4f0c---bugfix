@@ -31,6 +31,9 @@ REJECTED_UNKNOWN_CONSOLE = "REJECTED_UNKNOWN_CONSOLE"  # 未知控制台
 REJECTED_UNKNOWN_VALVE = "REJECTED_UNKNOWN_VALVE"      # 未知阀门
 REJECTED_FUTURE_DEPENDENCY = "REJECTED_FUTURE_DEPENDENCY"  # 未来依赖
 
+# 接收阶段可暂缓的拒绝：同批前驱事件可能尚未入队，须迭代至不动点后再定终态
+_DEFERRABLE_OUTCOMES = frozenset({REJECTED_SEQ_GAP, REJECTED_FUTURE_DEPENDENCY})
+
 VALVE_STATES = ("OPEN", "CLOSED")
 
 
@@ -137,7 +140,13 @@ class Store:
     # 事件提交（单个或离线批量）
     # ------------------------------------------------------------------
     def submit_batch(self, round_id, payloads):
-        """接收一批事件：逐条校验入队，随后按事件标识稳定裁决、连续消费。
+        """接收一批事件：迭代校验入队至不动点，随后按事件标识稳定裁决、连续消费。
+
+        离线恢复时，同一控制台的连续操作与跨控制台依赖链会同批到达，
+        而请求中的排列未必符合因果顺序。接收阶段因此迭代进行：每轮按
+        确定性顺序尝试接收入队，因跳号/未来依赖被暂缓的事件留待下一轮
+        重新判定；一轮中若再无新事件入队（不动点），仍被暂缓的跳号与
+        未来依赖即为真正的拒绝。结论与请求中的排列无关。
 
         返回每条事件的结论、本次被消费的事件列表（按消费顺序）及最新状态。
         """
@@ -146,8 +155,29 @@ class Store:
             if rd is None:
                 return None
             items = [None] * len(payloads)
-            for original_index, payload in self._canonical_batch(payloads):
-                items[original_index] = self._accept(rd, payload)
+            pending = self._canonical_batch(payloads)
+            while pending:
+                accepted_any = False
+                deferred = []
+                for original_index, payload in pending:
+                    item = self._accept(rd, payload)
+                    if item["event"] is not None:
+                        items[original_index] = item
+                        # 仅新入队的事件推进接收状态；重投不触发额外迭代
+                        accepted_any = accepted_any or not item["duplicate"]
+                    elif item["outcome"] in _DEFERRABLE_OUTCOMES:
+                        deferred.append((original_index, payload, item))
+                    else:
+                        items[original_index] = item
+                if not deferred:
+                    break
+                if not accepted_any:
+                    # 不动点：接收状态不再变化，暂缓项即为终态拒绝
+                    for original_index, _, item in deferred:
+                        items[original_index] = item
+                    break
+                pending = [(original_index, payload)
+                           for original_index, payload, _ in deferred]
             resolved = self._drain(rd)
             results = []
             for item in items:
@@ -174,8 +204,10 @@ class Store:
             }
 
     def _canonical_batch(self, payloads):
-        """为离线恢复请求建立与网络重放无关的确定性接收顺序。
+        """为离线恢复请求建立与网络重放无关的确定性处理顺序。
 
+        接收阶段按该顺序逐轮迭代至不动点，故同一因果闭包的批次无论请求
+        中如何排列都得到一致结论；同序号槽位的竞争也由该顺序稳定裁决。
         复制载荷与依赖向量，避免调用方在提交期间继续编辑离线队列，改写已经
         接受事件的指纹。原始位置另行保留，使响应仍与请求中的条目逐一对应。
         """

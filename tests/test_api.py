@@ -1,4 +1,6 @@
 """HTTP API 层测试（FastAPI TestClient）。"""
+import pytest
+
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -114,3 +116,50 @@ def test_batch_endpoint():
     assert r.status_code == 200
     got = {x["event_id"]: x["outcome"] for x in r.json()["results"]}
     assert got == {"evt-a-2": "RELEASED", "evt-z-2": "REJECTED_PRECONDITION"}
+
+
+def offline_chain():
+    """夜班离线恢复链：A#1 开 V1 → A#2 开 V2 → B#1 关 V2 → C#1 关 V1。"""
+    return [
+        {"event_id": "evt-z-a1", "console_id": "c1", "seq": 1, "deps": {},
+         "valve_id": "v1", "expected_old_state": "CLOSED", "new_state": "OPEN"},
+        {"event_id": "evt-a-a2", "console_id": "c1", "seq": 2, "deps": {},
+         "valve_id": "v2", "expected_old_state": "CLOSED", "new_state": "OPEN"},
+        {"event_id": "evt-b-b1", "console_id": "c2", "seq": 1, "deps": {"c1": 2},
+         "valve_id": "v2", "expected_old_state": "OPEN", "new_state": "CLOSED"},
+        {"event_id": "evt-c-c1", "console_id": "c3", "seq": 1, "deps": {"c2": 1},
+         "valve_id": "v1", "expected_old_state": "OPEN", "new_state": "CLOSED"},
+    ]
+
+
+CHAIN_LOG_ORDER = ["evt-z-a1", "evt-a-a2", "evt-b-b1", "evt-c-c1"]
+
+
+@pytest.mark.parametrize("order", [
+    [0, 1, 2, 3],   # A 的本地记录顺序再接 B、C
+    [3, 2, 1, 0],   # 完全逆序：依赖全部先于前驱到达
+    [2, 0, 3, 1],   # 交叉排列
+    [1, 3, 0, 2],   # 同控制台连续操作被拆开
+])
+def test_offline_recovery_chain_over_http(order):
+    """离线恢复链经批量接口：四项全部放行，请求排列不影响结论与状态。"""
+    rid = make_round()
+    chain = offline_chain()
+    r = client.post(f"/rounds/{rid}/events/batch",
+                    json={"events": [chain[i] for i in order]})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # 响应与请求条目逐一对应，且四项全部放行
+    assert [x["event_id"] for x in body["results"]] == [chain[i]["event_id"] for i in order]
+    assert all(x["outcome"] == "RELEASED" for x in body["results"])
+    assert [e["event_id"] for e in body["resolved"]] == CHAIN_LOG_ORDER
+    st = client.get(f"/rounds/{rid}").json()
+    assert st["frontier"] == {"c1": 2, "c2": 1, "c3": 1}
+    assert st["waiting"] == []
+    assert [e["event_id"] for e in st["log"]] == CHAIN_LOG_ORDER
+    valves = {v["id"]: v["state"] for v in st["valves"]}
+    assert valves == {"v1": "CLOSED", "v2": "CLOSED"}
+    # 每项结论可稳定复查
+    for eid in CHAIN_LOG_ORDER:
+        e = client.get(f"/rounds/{rid}/events/{eid}").json()
+        assert e["outcome"] == "RELEASED"
